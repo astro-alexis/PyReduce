@@ -144,13 +144,12 @@ class HARPSPOL(Instrument):
     def get_wavecal_filename(self, header, channel, **kwargs):
         """Get the filename of the wavelength calibration config file.
 
-        Uses the HARPS non-pol NPZ files, since both beams see the same
-        spectral orders and the non-pol linelist has N orders matching
-        per-group trace counts.
+        Uses HARPSPOL-specific NPZ files with order numbering reversed
+        to match the top-to-bottom trace ordering (order 0 = reddest).
         """
-        harps_dir = join(dirname(dirname(__file__)), "HARPS")
+        harpspol_dir = dirname(__file__)
         fname = f"wavecal_{channel.lower()}_2D.npz"
-        fname = join(harps_dir, fname)
+        fname = join(harpspol_dir, fname)
         return fname
 
     def get_mask_filename(self, channel, **kwargs):
@@ -162,6 +161,7 @@ class HARPSPOL(Instrument):
 
     def get_wavelength_range(self, header, channel, **kwargs):
         wave_range = super().get_wavelength_range(header, channel, **kwargs)
-        # Reverse order (same as HARPS)
-        wave_range = wave_range[::-1]
+        # Config lists red→blue (5245→3779 A), matching bottom→top on CCD.
+        # No reversal needed (HARPS single-fiber reverses, but HARPSPOL
+        # dual-beam traces are ordered bottom-to-top = red-to-blue).
         return wave_range
