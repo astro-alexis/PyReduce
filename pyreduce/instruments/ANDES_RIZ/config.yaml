@@ -8,7 +8,7 @@ telescope: ELT
 date: DATE-OBS
 date_format: fits
 
-channels: [R0, R1, R2]
+channels: [R, R1, R2, IZ]
 extension: 0
 orientation: 0
 transpose: false
@@ -40,7 +40,7 @@ wl_min: WL_MIN
 wl_max: WL_MAX
 
 # File classification using ANDES E2E headers
-# Channel is determined by BAND header
+# Channel is determined by HDFMODEL header (distinguishes R variants and IZ)
 # File type is determined by SIMTYPE header
 # Even/odd flats are determined by FIBMODE header
 kw_bias: SIMTYPE
@@ -59,7 +59,7 @@ id_flat_odd: "^odd$"
 id_orders: "^flat_field$"
 id_wave: "^(fabry_perot|lfc)$"
 id_spec: "^spectrum$"
-id_channel: ["^ANDES_123_R3.hdf$", "^ANDES_full_F18A33_win_jmr_MC_T0019_Rband_p0.hdf$", "^Andes_full_F18A33_win_jmr_MC_T0108_Rband_P0_cfg1.hdf$"]
+id_channel: ["^ANDES_123_R3.hdf$", "^ANDES_full_F18A33_win_jmr_MC_T0019_Rband_p0.hdf$", "^Andes_full_F18A33_win_jmr_MC_T0108_Rband_P0_cfg1.hdf$", "^ANDES_123_IZ3.hdf$"]
 
 # Fiber grouping configuration
 # A/B/cal: spatial division of the slit
@@ -67,6 +67,8 @@ fibers:
   trace_by: FIBMODE
   fibers_per_order: 66  # implies per-order organization
   order_centers_file: order_centers_{channel}.yaml
+  # fiber 1 = top of slit (highest y), matching the ANDES E2E simulator
+  numbering: top_down
   groups:
     # Spatial groups
     A:

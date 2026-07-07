@@ -1,6 +1,70 @@
 # Changelog
 
 
+## [0.9b1] - 2026-06-17
+
+### Added
+- HERMES instrument (Mercator telescope)
+- MOSAIC LR-J / LR-H NIR channels and starsky example
+- ANDES YJH sampling/resolution example (`examples/andes_yjh_sampl.py`)
+- Explicit `fibers.numbering` config field (`bottom_up`/`top_down`) for fiber numbering direction
+- Fallback to `flat` files for `trace`/`curvature`/`scatter` when files are set manually
+
+### Changed
+- Extraction: `slitdec` (copied from charslit) is now the sole CFFI backend, ~10x faster
+- Wavecal: disentangle bundle index from spectral order `m`
+- ANDES YJH: env-var output suffix, `trace_range`, and IFU science flow
+- Trace: `center_weight` merge for missing-fiber bundles
+
+### Fixed
+- `get_supported_channels` for single-channel instruments
+- Bundle naming in `group_fibers` when one bundle per `m`
+
+## [0.8.2] - 2026-04-08
+
+### Fixed
+- Curvature step: fall back to per-trace height when `extraction_height` is `None` (matches `extract.py` behavior)
+
+### Changed
+- Lower minimum Python version to 3.12
+- CI test matrix now covers Python 3.12, 3.13, and 3.14
+
+## [0.8.1] - 2026-03-05
+
+### Added
+- CRIRES+ L-band example script
+- Settings fallback chain for composite channel names
+- `hdf2trace` tool: write HDF wavelength polynomials into trace FITS
+
+### Fixed
+- Fix `create_custom_instrument` crash (was returning None config)
+- Fix charslit backend selection to check env var at call time
+- Bundle centers fallback, curvature and norm_flat fixes for MOSAIC VIS
+
+### Changed
+- Rewrite custom instrument example as student-friendly walkthrough
+- `create_custom_instrument` now accepts `**overrides` for inline property setting
+
+## [0.8] - 2026-02-25
+
+No code changes from 0.8a5; docs update and stable release.
+
+## [0.8a5] - 2026-02-25
+
+### Added
+- ANDES_UBV instrument, IZ channel for ANDES_RIZ, per-channel settings files
+- Preserve individual fiber traces alongside merged group traces
+- Tests for `get_y_scale` covering standard, edge, and invariant cases
+
+### Fixed
+- Center extraction window on trace peak (+0.5/+1 shift for odd/even height)
+- Fix `get_y_scale` silently mutating caller's ycen array
+- Fix slit function plot alignment in ProgressPlot
+- Fix curvature save: match traces by (m, group) instead of index
+- Recompute heights after merging even/odd fibers (use nearest neighbor)
+- Fix test warnings: tempfile leak, divide-by-zero, misplaced instrument test
+- Guard against empty order_centers YAML files
+
 ## [0.8a4] - 2026-02-14
 
 ### Added

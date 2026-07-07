@@ -593,9 +593,11 @@ class Pipeline:
             "flat": lambda: pipe.flat(files.get("flat", []))
             if len(files.get("flat", []))
             else pipe,
-            "trace": lambda: pipe.trace(files.get("trace")),
-            "curvature": lambda: pipe.curvature(files.get("curvature")),
-            "scatter": lambda: pipe.scatter(files.get("scatter")),
+            "trace": lambda: pipe.trace(files.get("trace", files.get("flat"))),
+            "curvature": lambda: pipe.curvature(
+                files.get("curvature", files.get("flat"))
+            ),
+            "scatter": lambda: pipe.scatter(files.get("scatter", files.get("flat"))),
             "norm_flat": lambda: pipe.normalize_flat(),
             "wavecal_master": lambda: pipe.wavecal_master(
                 files.get("wavecal_master", [])
@@ -700,11 +702,18 @@ class Pipeline:
         util.set_plot_dir(plot_dir)
         util.set_plot_show(plot_show, plot_level=plot)
 
-        # Load configuration (channel-specific if settings_{channel}.json exists)
-        config = load_config(configuration, instrument, 0, channel=channel)
-
-        # Load instrument
+        # Load instrument (before config, so we can get settings fallbacks)
         inst = load_instrument(instrument)
+
+        # Load configuration (channel-specific if settings_{channel}.json exists)
+        channel_fallbacks = inst.get_settings_fallbacks(channel) if channel else None
+        config = load_config(
+            configuration,
+            instrument,
+            0,
+            channel=channel,
+            channel_fallbacks=channel_fallbacks,
+        )
         info = inst.info
 
         # Get directories from config if not specified

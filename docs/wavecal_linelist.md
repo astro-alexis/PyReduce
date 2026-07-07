@@ -61,12 +61,12 @@ Order numbers are assigned to traces in one of three ways:
    and assigned the corresponding order number immediately.
 
    ```yaml
-   # Example: pyreduce/instruments/ANDES_RIZ/order_centers_r2.yaml
-   orders:
-     85: 2048.5   # Order 85 centered at y=2048.5
-     86: 1892.3
-     87: 1741.2
-     ...
+   # Example: pyreduce/instruments/ANDES_RIZ/order_centers_r.yaml
+   # Y-position of center fiber at detector center
+   81: 8371.1   # Order 81 centered at y=8371.1
+   82: 7772.6
+   83: 7194.3
+   ...
    ```
 
 2. **From the initial linelist** (wavecal_init step):
@@ -83,22 +83,25 @@ Order numbers are assigned to traces in one of three ways:
 ### Why Order Numbers Matter
 
 The 2D wavelength polynomial fits wavelength as a function of both pixel position (x)
-and order number (m):
+and trace index (idx):
 
 ```
-wavelength = P(x, m) = sum_{i,j} c_{i,j} * x^i * m^j
+wavelength = P(x, idx) = sum_{i,j} c_{i,j} * x^i * idx^j
 ```
 
-Using physical order numbers (not sequential indices) is critical because the grating
-equation creates predictable relationships between adjacent orders. A fit using physical
-order numbers can interpolate and extrapolate more accurately.
+Currently the fit uses sequential trace indices (0, 1, 2, ...) as the order
+coordinate, assigned per group. Each trace stores its index in `_wave_idx`.
 
-When you call `Trace.wlen(x)`, it evaluates the 2D polynomial at the trace's order number:
+When you call `Trace.wlen(x)`, it evaluates the 2D polynomial at the trace's index:
 
 ```python
 # Inside Trace.wlen():
-wavelength = np.polynomial.polynomial.polyval2d(x, self.m, self.wave)
+wavelength = np.polynomial.polynomial.polyval2d(x, self._wave_idx, self.wave)
 ```
+
+Physical order numbers (`trace.m`) are used for identification and matching, but the
+polynomial evaluation uses the sequential index because that is what the fit was built
+against.
 
 ## Gas Lamp Calibration
 

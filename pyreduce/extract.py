@@ -27,21 +27,35 @@ from .util import make_index
 
 logger = logging.getLogger(__name__)
 
-# Backend selection: set PYREDUCE_USE_CHARSLIT=1 to use charslit
-USE_CHARSLIT = os.environ.get("PYREDUCE_USE_CHARSLIT", "0") == "1"
-# Slitdelta correction: set PYREDUCE_USE_DELTAS=0 to disable (default enabled)
-USE_DELTAS = os.environ.get("PYREDUCE_USE_DELTAS", "1") == "1"
+from . import cwrappers
 
-if USE_CHARSLIT:
-    import charslit
+# The default backend is the CFFI slitdec extension (pyreduce.clib, wrapped by
+# cwrappers.slitdec), whose C source is copied from charslit. Set
+# PYREDUCE_USE_CHARSLIT=1 to instead import the external charslit package, for
+# trying out upstream charslit development before copying it over.
+# Checked at call time so env var changes within a process take effect.
+_charslit_mod = None
 
-    logger.info("Using charslit extraction backend")
-    if not USE_DELTAS:
-        logger.info("Slitdelta correction disabled (PYREDUCE_USE_DELTAS=0)")
-else:
-    from . import cwrappers
 
-    logger.info("Using CFFI extraction backend")
+def _use_charslit():
+    return os.environ.get("PYREDUCE_USE_CHARSLIT", "0") == "1"
+
+
+def _use_deltas():
+    return os.environ.get("PYREDUCE_USE_DELTAS", "1") == "1"
+
+
+def _get_charslit():
+    """Return the slitdec backend: the external charslit package when
+    PYREDUCE_USE_CHARSLIT=1, otherwise the vendored cwrappers implementation."""
+    if _use_charslit():
+        global _charslit_mod
+        if _charslit_mod is None:
+            import charslit
+
+            _charslit_mod = charslit
+        return _charslit_mod
+    return cwrappers
 
 
 def _slitdec_charslit(
@@ -85,7 +99,8 @@ def _slitdec_charslit(
     reject_threshold : float
         Outlier rejection threshold in sigma units (passed as kappa to charslit)
     preset_slitfunc : array or None
-        Preset slit function (not supported by charslit yet, ignored)
+        Preset slit function (length ny or nrows). If given, the slit-function
+        solve is skipped and only the spectrum is fit against it.
 
     Returns
     -------
@@ -134,12 +149,13 @@ def _slitdec_charslit(
         slitdeltas = np.zeros(nrows, dtype=np.float64)
     slitdeltas = np.ascontiguousarray(slitdeltas.astype(np.float64))
 
-    # Note: preset_slitfunc is not currently supported by charslit
     if preset_slitfunc is not None:
-        logger.debug("preset_slitfunc is not yet supported by charslit, ignoring")
+        preset_slitfunc = np.ascontiguousarray(
+            np.asarray(preset_slitfunc, dtype=np.float64)
+        )
 
     # Call charslit
-    result = charslit.slitdec(
+    result = _get_charslit().slitdec(
         data,
         pix_unc,
         mask_c,
@@ -151,6 +167,7 @@ def _slitdec_charslit(
         lambda_sL=float(lambda_sf),
         maxiter=maxiter,
         kappa=float(reject_threshold),
+        preset_slitfunc=preset_slitfunc,
     )
 
     sp = result["spectrum"]
@@ -171,51 +188,6 @@ def _slitdec_charslit(
         info = np.array([float(return_code == 0), 0.0, float(return_code), 0.0, 0.0])
 
     return sp, sl, model, unc, mask_out, info
-
-
-def _slitdec_cffi(
-    img,
-    ycen,
-    curvature,
-    lambda_sp,
-    lambda_sf,
-    osample,
-    yrange,
-    maxiter,
-    gain,
-    reject_threshold,
-    preset_slitfunc,
-):
-    """Call CFFI slitfunc_curved and return results in the same format as charslit.
-
-    This is the legacy extraction backend using the CFFI C extension.
-    Only supports curvature degrees 1-2 (p1, p2).
-    """
-    # Extract p1, p2 from curvature array
-    if curvature is not None:
-        p1 = curvature[:, 1] if curvature.shape[1] > 1 else np.zeros(curvature.shape[0])
-        p2 = curvature[:, 2] if curvature.shape[1] > 2 else np.zeros(curvature.shape[0])
-    else:
-        ncols = len(ycen)
-        p1 = np.zeros(ncols)
-        p2 = np.zeros(ncols)
-
-    sp, sl, model, unc, mask, info = cwrappers.slitfunc_curved(
-        img,
-        ycen,
-        p1,
-        p2,
-        lambda_sp,
-        lambda_sf,
-        osample,
-        yrange,
-        maxiter=maxiter,
-        gain=gain,
-        reject_threshold=reject_threshold,
-        preset_slitfunc=preset_slitfunc,
-    )
-
-    return sp, sl, model, unc, mask, info
 
 
 def _ensure_slitcurve(curvature, ncols, n_coeffs=6):
@@ -437,7 +409,7 @@ class ProgressPlot:  # pragma: no cover
         x_slit, y_slit = self.get_slitf(img, spec, slitf, ycen, slitcurve, slitdeltas)
         ycen = ycen + ny / 2
 
-        old = np.linspace(-1, ny, len(slitf))
+        old = np.linspace(-1, ny, len(slitf)) + 0.5
 
         # Separate rejected (output_mask=True) and good (output_mask=False) pixels
         rejected = output_mask.ravel()
@@ -528,7 +500,7 @@ class ProgressPlot:  # pragma: no cover
         if not np.isnan(limit):
             self.ax_spec.set_ylim((0, limit))
 
-        self.ax_slit.set_ylim((0, ny - 1))
+        self.ax_slit.set_ylim((0, ny))
         limit = np.nanmax(slitf) * 1.1
         if not np.isnan(limit):
             self.ax_slit.set_xlim((0, limit))
@@ -591,7 +563,7 @@ class ProgressPlot:  # pragma: no cover
         ycen_frac = ycen - ycen.astype(int)
 
         # Slit position for display
-        slit_pos = row_idx - ycen_frac + 0.5
+        slit_pos = row_idx - ycen_frac + 1
 
         # Compute effective column position for spectrum lookup
         col_eff = col_idx.astype(float)
@@ -1166,14 +1138,6 @@ def extract_spectrum(
             f"Ensure norm_flat and extraction use the same extraction_height and osample."
         )
 
-    # CFFI backend only supports curvature degree <= 2; truncate if needed
-    if not USE_CHARSLIT and curvature is not None and curvature.shape[1] > 3:
-        logger.warning(
-            "curve_degree > 2 requires charslit backend. "
-            "Truncating to degree 2. Set PYREDUCE_USE_CHARSLIT=1 for full curvature support."
-        )
-        curvature = curvature[:, :3]
-
     ycen_int = np.floor(ycen).astype(int)
 
     spec = np.zeros(ncol) if out_spec is None else out_spec
@@ -1232,7 +1196,7 @@ def extract_spectrum(
 
             # Prepare curvature for both backends and visualization
             slitcurve = _ensure_slitcurve(swath_curv, swath_ncols)
-            if USE_DELTAS and slitdeltas is not None and len(slitdeltas) > 0:
+            if _use_deltas() and slitdeltas is not None and len(slitdeltas) > 0:
                 # Interpolate slitdeltas to match swath nrows if needed
                 if len(slitdeltas) == swath_nrows:
                     swath_slitdeltas = slitdeltas.astype(np.float64)
@@ -1244,40 +1208,25 @@ def extract_spectrum(
             else:
                 swath_slitdeltas = None
 
-            if USE_CHARSLIT:
-                charslit_slitdeltas = (
-                    swath_slitdeltas
-                    if swath_slitdeltas is not None
-                    else np.zeros(swath_nrows, dtype=np.float64)
-                )
-                swath[ihalf] = _slitdec_charslit(
-                    swath_img,
-                    swath_ycen_abs,
-                    slitcurve,
-                    charslit_slitdeltas,
-                    lambda_sp=lambda_sp,
-                    lambda_sf=lambda_sf,
-                    osample=osample,
-                    yrange=yrange,
-                    maxiter=maxiter,
-                    gain=gain,
-                    reject_threshold=reject_threshold,
-                    preset_slitfunc=preset_slitfunc,
-                )
-            else:
-                swath[ihalf] = _slitdec_cffi(
-                    swath_img,
-                    swath_ycen_abs,
-                    swath_curv,
-                    lambda_sp=lambda_sp,
-                    lambda_sf=lambda_sf,
-                    osample=osample,
-                    yrange=yrange,
-                    maxiter=maxiter,
-                    gain=gain,
-                    reject_threshold=reject_threshold,
-                    preset_slitfunc=preset_slitfunc,
-                )
+            charslit_slitdeltas = (
+                swath_slitdeltas
+                if swath_slitdeltas is not None
+                else np.zeros(swath_nrows, dtype=np.float64)
+            )
+            swath[ihalf] = _slitdec_charslit(
+                swath_img,
+                swath_ycen_abs,
+                slitcurve,
+                charslit_slitdeltas,
+                lambda_sp=lambda_sp,
+                lambda_sf=lambda_sf,
+                osample=osample,
+                yrange=yrange,
+                maxiter=maxiter,
+                gain=gain,
+                reject_threshold=reject_threshold,
+                preset_slitfunc=preset_slitfunc,
+            )
             t.set_postfix(chi=f"{swath[ihalf][5][1]:1.2f}")
 
             if normalize:
@@ -1395,15 +1344,19 @@ def get_y_scale(ycen, xrange, extraction_height, nrow):
 
     Returns
     -------
-    y_low, y_high : int, int
+    ylow, yhigh : int, int
         lower and upper y bound for extraction (pixels below/above trace)
-        These satisfy: y_low + y_high + 1 = extraction_height
+        These satisfy: ylow + yhigh + 1 = extraction_height
     """
-    ycen = ycen[xrange[0] : xrange[1]]
+    ycen = ycen[xrange[0] : xrange[1]].copy()
     half = extraction_height // 2
 
-    ymin = ycen - half
-    ymin = np.floor(ymin)
+    if extraction_height % 2 == 0:
+        ycen += 1
+    else:
+        ycen += 0.5
+    ymin = np.floor(ycen - half).astype(int)
+
     if min(ymin) < 0:
         ymin = ymin - min(ymin)  # help for orders at edge
     if max(ymin) >= nrow:
@@ -1414,11 +1367,10 @@ def get_y_scale(ycen, xrange, extraction_height, nrow):
         ymax = ymax - max(ymax) + nrow - 1  # helps at edge
         ymin = ymax - extraction_height + 1
 
-    # Define a fixed height area containing one spectral order
-    y_lower_lim = int(np.min(ycen - ymin))  # Pixels below center line
-    y_upper_lim = int(np.min(ymax - ycen))  # Pixels above center line
+    ylow = int(np.min(ycen - ymin))  # Pixels below center line
+    yhigh = extraction_height - 1 - ylow  # Guarantee total = extraction_height
 
-    return y_lower_lim, y_upper_lim
+    return ylow, yhigh
 
 
 def optimal_extraction(
@@ -1497,6 +1449,10 @@ def optimal_extraction(
         # Define a fixed height area containing one trace
         ycen = np.polyval(traces[i], ix)
         yrange = get_y_scale(ycen, column_range[i], extraction_height[i], nrow)
+        # Shift ycen so floor() rounds to nearest integer, centering the trace
+        # in the extraction window (sub-pixel offset near 0 instead of biased to +1)
+        cr = column_range[i]
+        ycen[cr[0] : cr[1]] += 0.5 if extraction_height[i] % 2 == 1 else 1
 
         osample = kwargs.get("osample", 1)
         slitfunction[i] = np.zeros(osample * (sum(yrange) + 2) + 1)

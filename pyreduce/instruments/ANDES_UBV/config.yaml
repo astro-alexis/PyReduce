@@ -1,0 +1,87 @@
+# ANDES blue-arm instrument configuration
+# 66-fiber slit, 9216x9232 detector, bands U/B/V
+
+__instrument__: ANDES_UBV
+instrument: INSTRUME
+id_instrument: "ANDES"
+telescope: ELT
+
+date: DATE-OBS
+date_format: fits
+
+channels: [U, B, V]
+extension: 0
+orientation: 0
+transpose: false
+
+prescan_x: 0
+overscan_x: 0
+prescan_y: 0
+overscan_y: 0
+naxis_x: NAXIS1
+naxis_y: NAXIS2
+
+gain: 1
+readnoise: 0
+dark: 0
+sky: 0
+exposure_time: EXPTIME
+
+ra: null
+dec: null
+target: PYE1
+
+# ANDES E2E simulation headers
+hdfmodel: HDFMODEL
+simtype: SIMTYPE
+srctype: SRCTYPE
+fibmode: FIBMODE
+vshift: VSHIFT
+wl_min: WL_MIN
+wl_max: WL_MAX
+
+# File classification
+kw_bias: SIMTYPE
+kw_flat: SIMTYPE
+kw_flat_even: FIBMODE
+kw_flat_odd: FIBMODE
+kw_orders: SIMTYPE
+kw_wave: SIMTYPE
+kw_spec: SIMTYPE
+kw_channel: BAND
+
+id_bias: "^bias$"
+id_flat: "^flat_field$"
+id_flat_even: "^even$"
+id_flat_odd: "^odd$"
+id_orders: "^flat_field$"
+id_wave: "^(fabry_perot|lfc)$"
+id_spec: "^spectrum$"
+id_channel: ["^U$", "^B$", "^V$"]
+
+# Fiber grouping (66 fibers, same layout as ANDES_RIZ)
+fibers:
+  trace_by: FIBMODE
+  fibers_per_order: 66
+  order_centers_file: order_centers_{channel}.yaml
+  # fiber 1 = top of slit (highest y), matching the ANDES E2E simulator
+  numbering: top_down
+  groups:
+    A:
+      range: [1, 32]
+      merge: average
+      height: derived
+    cal:
+      range: [33, 35]
+      merge: average
+      height: derived
+    B:
+      range: [36, 67]
+      merge: average
+      height: derived
+  use:
+    curvature: [A, B]
+    norm_flat: [A, B]
+    wavecal: [A]
+    wavecal_master: [A]
+    science: [A, B]

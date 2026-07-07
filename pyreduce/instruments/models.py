@@ -85,7 +85,9 @@ class FiberGroupConfig(BaseModel):
     """
 
     range: tuple[int, int]  # [start, end) half-open interval, 1-based
-    merge: str | list[int] = "center"  # "average", "center", or [indices]
+    merge: str | list[int] = (
+        "center"  # "average", "center", "center_weight", or [indices]
+    )
     height: float | Literal["derived"] | None = None
 
     model_config = ConfigDict(extra="forbid")
@@ -104,7 +106,9 @@ class FiberBundleConfig(BaseModel):
 
     size: int  # expected fibers per bundle
     count: int | None = None  # number of bundles (validated if provided)
-    merge: str | list[int] = "center"  # "average", "center", or [indices]
+    merge: str | list[int] = (
+        "center"  # "average", "center", "center_weight", or [indices]
+    )
     height: str | float | None = "derived"  # "derived", explicit pixels, or None
 
     # Bundle centers for robust assignment (handles missing fibers)
@@ -161,6 +165,14 @@ class FibersConfig(BaseModel):
     order_centers: dict[int, float] | None = None  # inline (single channel only)
     order_centers_file: str | list[str] | None = None  # per-channel list supported
 
+    # Direction in which fiber_idx is numbered within each order/group:
+    #   "bottom_up" (default) -> fiber 1 = lowest-y trace
+    #   "top_down"            -> fiber 1 = highest-y trace
+    # Set this to match the frame your group/ring `range`s are written in.
+    # ANDES uses "top_down" so the ranges line up with the E2E simulator's
+    # fiber numbering (fiber 1 at the top of the slit).
+    numbering: Literal["top_down", "bottom_up"] = "bottom_up"
+
     model_config = ConfigDict(extra="forbid")
 
     @field_validator("order_centers", mode="before")
@@ -190,6 +202,26 @@ class FibersConfig(BaseModel):
                     "using auto-pairing mode (consecutive traces grouped by y-proximity)",
                     self.fibers_per_order,
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_no_bundle_named_groups(self):
+        """Reject named groups whose names collide with bundle merge names.
+
+        Bundle merges produce group names of the form ``bundle_<int>``;
+        a named group with the same shape would create silent name
+        collisions in selection.
+        """
+        import re
+
+        if self.groups:
+            pat = re.compile(r"^bundle_\d+$")
+            for name in self.groups:
+                if pat.match(name):
+                    raise ValueError(
+                        f"Group name {name!r} collides with bundle merge "
+                        f"naming (bundle_<int>); pick a different name."
+                    )
         return self
 
 

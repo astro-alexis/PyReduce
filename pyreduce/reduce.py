@@ -52,6 +52,7 @@ from .rectify import merge_images, rectify_image
 from .slit_curve import Curvature as CurvatureModule
 from .spectra import ExtractionParams, Spectra, Spectrum
 from .trace import (
+    _compute_heights_inplace,
     group_fibers,
     select_traces_for_step,
 )
@@ -855,6 +856,8 @@ class Trace(CalibrationStep):
         self.noise_relative = config.get("noise_relative", 0)
         #:int: Polynomial degree of the fit to each order
         self.fit_degree = config["degree"]
+        #:float: Maximum RMS of the order fit; clusters above this are discarded
+        self.max_error = config.get("max_error", None)
 
         self.degree_before_merge = config["degree_before_merge"]
         self.regularization = config["regularization"]
@@ -899,8 +902,12 @@ class Trace(CalibrationStep):
 
         logger.info("Tracing files: %s", files)
 
-        # Load order_centers for m assignment if available
+        # Load order_centers for m assignment, and bundle_centers for
+        # bundle assignment. They are independent: order_centers populates
+        # t.m (spectral order), bundle_centers populates t.bundle (spatial
+        # bundle id within an order).
         order_centers = self._load_order_centers()
+        bundle_centers = self._load_bundle_centers()
 
         # Check if we should trace file groups separately
         fibers_config = getattr(self.instrument.config, "fibers", None)
@@ -908,10 +915,12 @@ class Trace(CalibrationStep):
 
         if trace_by and len(files) > 1:
             raw_traces = self._trace_by_groups(
-                files, mask, bias, trace_by, order_centers
+                files, mask, bias, trace_by, order_centers, bundle_centers
             )
         else:
-            raw_traces = self._trace_single(files, mask, bias, order_centers)
+            raw_traces = self._trace_single(
+                files, mask, bias, order_centers, bundle_centers
+            )
 
         # Store heights for backward compatibility
         self.heights = np.array(
@@ -922,9 +931,13 @@ class Trace(CalibrationStep):
         if fibers_config is not None and (
             fibers_config.groups is not None or fibers_config.bundles is not None
         ):
-            self.trace_objects = group_fibers(
-                raw_traces, fibers_config, degree=self.fit_degree
+            grouped = group_fibers(
+                raw_traces,
+                fibers_config,
+                degree=self.fit_degree,
+                bundle_centers=bundle_centers,
             )
+            self.trace_objects = grouped + raw_traces
         else:
             self.trace_objects = raw_traces
 
@@ -973,6 +986,10 @@ class Trace(CalibrationStep):
         with open(path) as f:
             data = yaml.safe_load(f)
 
+        if not data:
+            logger.info("Order centers file is empty: %s", path)
+            return None
+
         if "order_centers" in data:
             data = data["order_centers"]
 
@@ -980,7 +997,63 @@ class Trace(CalibrationStep):
         logger.info("Loaded order centers from %s: %d orders", path, len(order_centers))
         return order_centers
 
-    def _trace_by_groups(self, files, mask, bias, trace_by, order_centers):
+    def _load_bundle_centers(self) -> dict[int, float] | None:
+        """Load bundle_centers from fibers.bundles config as order_centers fallback."""
+        fibers_config = getattr(self.instrument.config, "fibers", None)
+        if fibers_config is None or fibers_config.bundles is None:
+            return None
+
+        bundles = fibers_config.bundles
+
+        if bundles.bundle_centers is not None:
+            logger.info(
+                "Using inline bundle_centers: %d bundles", len(bundles.bundle_centers)
+            )
+            return bundles.bundle_centers
+
+        if bundles.bundle_centers_file is None:
+            return None
+
+        from pathlib import Path
+
+        import yaml
+
+        centers_file = bundles.bundle_centers_file
+        if isinstance(centers_file, list):
+            channels = self.instrument.config.channels or []
+            ch_idx = channels.index(self.channel) if self.channel in channels else 0
+            centers_file = (
+                centers_file[ch_idx] if ch_idx < len(centers_file) else centers_file[0]
+            )
+
+        if self.channel and "{channel}" in centers_file:
+            centers_file = centers_file.format(channel=self.channel.lower())
+
+        inst_dir = getattr(self.instrument, "_inst_dir", None)
+        path = Path(centers_file)
+        if not path.is_absolute() and inst_dir:
+            path = Path(inst_dir) / centers_file
+
+        if not path.exists():
+            logger.info("Bundle centers file not found: %s", path)
+            return None
+
+        with open(path) as f:
+            data = yaml.safe_load(f)
+
+        if not data:
+            return None
+
+        if "bundle_centers" in data:
+            data = data["bundle_centers"]
+
+        result = {int(k): float(v) for k, v in data.items()}
+        logger.info("Loaded bundle_centers from %s: %d bundles", path, len(result))
+        return result
+
+    def _trace_by_groups(
+        self, files, mask, bias, trace_by, order_centers, bundle_centers=None
+    ):
         """Trace files grouped by header value, then merge traces.
 
         Parameters
@@ -1021,17 +1094,45 @@ class Trace(CalibrationStep):
         all_traces = []
         for group_key, group_files in file_groups.items():
             logger.info("Tracing group '%s': %d files", group_key, len(group_files))
-            traces = self._trace_single(group_files, mask, bias, order_centers)
+            traces = self._trace_single(
+                group_files, mask, bias, order_centers, bundle_centers
+            )
             logger.info("  Found %d traces", len(traces))
             all_traces.extend(traces)
 
-        # Sort by y-position
-        def sort_key(t):
-            # Use middle of column range for y evaluation
-            x_mid = sum(t.column_range) / 2
-            return t.y_at_x(x_mid)
+        # Re-assign fiber_idx within each (m, bundle), since each trace_by
+        # group assigned its own 1..N independently. Direction follows
+        # fibers.numbering, matching assign_orders_and_fibers.
+        from collections import defaultdict
 
-        all_traces.sort(key=sort_key)
+        fibers_config = getattr(self.instrument.config, "fibers", None)
+        top_down = (
+            getattr(fibers_config, "numbering", "bottom_up") == "top_down"
+            if fibers_config
+            else False
+        )
+
+        traces_by_mb = defaultdict(list)
+        for t in all_traces:
+            traces_by_mb[(t.m, t.bundle)].append(t)
+
+        for _key, order_traces in traces_by_mb.items():
+            x_mid = sum(order_traces[0].column_range) / 2
+            order_traces.sort(key=lambda t: t.y_at_x(x_mid), reverse=top_down)
+            for idx, t in enumerate(order_traces, start=1):
+                t.fiber_idx = idx
+
+        # Recompute heights now that all groups are merged, so each trace
+        # sees its true nearest neighbor (not just within its trace_by group).
+        ncol = max(t.column_range[1] for t in all_traces)
+        x_mid = ncol // 2
+        all_traces.sort(key=lambda t: t.y_at_x(x_mid))
+        _compute_heights_inplace(all_traces, ncol)
+
+        # Sort by (m descending, fiber_idx)
+        all_traces.sort(
+            key=lambda t: (-t.m if t.m is not None else 0, t.fiber_idx or 0)
+        )
 
         logger.info(
             "Merged %d total traces from %d groups", len(all_traces), len(file_groups)
@@ -1039,7 +1140,7 @@ class Trace(CalibrationStep):
 
         return all_traces
 
-    def _trace_single(self, files, mask, bias, order_centers):
+    def _trace_single(self, files, mask, bias, order_centers, bundle_centers=None):
         """Trace a single set of files.
 
         Returns
@@ -1054,6 +1155,11 @@ class Trace(CalibrationStep):
         fpo = (
             getattr(fibers_config, "fibers_per_order", None) if fibers_config else None
         )
+        top_down = (
+            getattr(fibers_config, "numbering", "bottom_up") == "top_down"
+            if fibers_config
+            else False
+        )
 
         traces = mark_orders(
             trace_img,
@@ -1065,6 +1171,7 @@ class Trace(CalibrationStep):
             noise=self.noise,
             noise_relative=self.noise_relative,
             degree=self.fit_degree,
+            max_error=self.max_error,
             degree_before_merge=self.degree_before_merge,
             regularization=self.regularization,
             closing_shape=self.closing_shape,
@@ -1078,6 +1185,8 @@ class Trace(CalibrationStep):
             plot_title=self.plot_title,
             order_centers=order_centers,
             fibers_per_order=fpo,
+            bundle_centers=bundle_centers,
+            top_down=top_down,
         )
 
         return traces
@@ -1254,6 +1363,10 @@ class NormalizeFlatField(Step):
         slitfunc_meta : dict
             Metadata for slitfunc (extraction_height, osample, trace_range)
         """
+        if flat is None or (isinstance(flat, tuple) and flat[0] is None):
+            logger.warning("No master flat available, skipping flat normalization")
+            return None
+
         flat, fhead = flat
 
         # Apply fiber selection based on instrument config
@@ -1417,8 +1530,17 @@ class WavelengthCalibrationMaster(CalibrationStep, ExtractionStep):
         # Apply fiber selection based on instrument config
         selected = self._select_traces(trace, "wavecal_master")
 
-        # Load wavecal image (same for all groups)
-        orig, thead = self.calibrate(files, mask, bias, norm_flat)
+        # Load wavecal image (same for all groups) and overlay selected
+        # traces on the diagnostic plot, like the science step does.
+        all_selected = [t for group_traces in selected.values() for t in group_traces]
+        orig, thead = self.calibrate(
+            files,
+            mask,
+            bias,
+            norm_flat,
+            traces=all_selected if all_selected else None,
+            extraction_height=self.extraction_kwargs.get("extraction_height"),
+        )
 
         # Extract per group
         results = {}
@@ -1494,12 +1616,26 @@ class WavelengthCalibrationMaster(CalibrationStep, ExtractionStep):
         return results
 
 
+def _is_single_order_multi_bundle(traces) -> bool:
+    """True iff every trace is a bundle of a single-order spectrograph.
+
+    Used to switch wavecal between (a) the multi-order indexing where each
+    extracted row is a distinct spectral order, and (b) the MOSAIC-style
+    case where every row is a different fiber bundle sharing one m.
+    """
+    return (
+        len(traces) > 1
+        and all(t.bundle is not None for t in traces)
+        and all(t.m is None for t in traces)
+    )
+
+
 class WavelengthCalibrationInitialize(Step):
     """Create the initial wavelength solution file"""
 
     def __init__(self, *args, **config):
         super().__init__(*args, **config)
-        self._dependsOn += ["wavecal_master"]
+        self._dependsOn += ["wavecal_master", "trace"]
         self._loadDependsOn += ["config", "wavecal_master"]
 
         self.degree = config["degree"]
@@ -1513,6 +1649,7 @@ class WavelengthCalibrationInitialize(Step):
         self.medium = config["medium"]
         self.smoothing = config["smoothing"]
         self.cutoff = config["cutoff"]
+        self.wave_delta = config.get("wave_delta", 20)
 
     def savefile_for_group(self, group: str) -> str:
         """Get savefile path for a specific group."""
@@ -1525,22 +1662,35 @@ class WavelengthCalibrationInitialize(Step):
         """str: Name of the linelist file (single-group compat)"""
         return self.savefile_for_group("all")
 
-    def run(self, wavecal_master: dict):
+    def run(self, wavecal_master: dict, trace: list):
         """Run iterative line matching for each fiber group.
 
         Parameters
         ----------
         wavecal_master : dict[str, tuple]
             {group: (wavecal_spec, thead)} from wavecal_master step
+        trace : list[TraceData]
+            All trace objects (used to detect single-order multi-bundle mode)
 
         Returns
         -------
         results : dict[str, LineList]
             {group: linelist} for each fiber group
         """
+        selected = self._select_traces(trace, "wavecal_master")
+
         results = {}
         for group, (wavecal_spec, thead) in wavecal_master.items():
             logger.info("Running wavecal_init for group '%s'", group)
+
+            group_traces = selected.get(group, [])
+            single_order = _is_single_order_multi_bundle(group_traces)
+            if single_order:
+                logger.info(
+                    "Group '%s': single-order multi-bundle mode (%d bundles)",
+                    group,
+                    len(group_traces),
+                )
 
             # Get the initial wavelength guess from the instrument
             wave_range = self.instrument.get_wavelength_range(thead, self.channel)
@@ -1548,6 +1698,16 @@ class WavelengthCalibrationInitialize(Step):
                 raise ValueError(
                     "This instrument is missing an initial wavelength guess for wavecal_init"
                 )
+
+            # Per-bundle guess (single-order multi-bundle): look up each spectrum
+            # row's range by its trace bundle id. group_traces is in the same
+            # order as the extracted wavecal_spec rows.
+            per_bundle = self.instrument.get_wavelength_range_per_bundle(
+                thead, self.channel
+            )
+            if single_order and per_bundle and group_traces:
+                default = wave_range[0]
+                wave_range = [per_bundle.get(t.bundle, default) for t in group_traces]
 
             module = WavelengthCalibrationInitializeModule(
                 plot=self.plot,
@@ -1564,8 +1724,11 @@ class WavelengthCalibrationInitialize(Step):
                 medium=self.medium,
                 smoothing=self.smoothing,
                 cutoff=self.cutoff,
+                wave_delta=self.wave_delta,
             )
-            linelist = module.execute(wavecal_spec, wave_range)
+            linelist = module.execute(
+                wavecal_spec, wave_range, single_order=single_order
+            )
             results[group] = linelist
 
         self.save(results)
@@ -1725,42 +1888,51 @@ class WavelengthCalibrationFinalize(Step):
         results : dict[str, tuple]
             {group: (wave_coef, linelist)} polynomial coefficients per group
         """
-        # Group traces by their group attribute AND by fiber_idx
-        traces_by_group = {}
-        traces_by_fiber = {}
-        for i, t in enumerate(trace):
-            g = str(t.group) if t.group is not None else "all"
-            if g not in traces_by_group:
-                traces_by_group[g] = []
-            traces_by_group[g].append((i, t))
-            if t.fiber_idx is not None:
-                fkey = f"fiber_{t.fiber_idx}"
-                if fkey not in traces_by_fiber:
-                    traces_by_fiber[fkey] = []
-                traces_by_fiber[fkey].append((i, t))
+        # Resolve traces with the SAME selection wavecal_master used, so the
+        # wave rows line up with the right traces and in the same order. Using
+        # t.group directly is wrong for single-order multi-bundle instruments
+        # (MOSAIC): the trace list mixes bundle representatives with the raw
+        # ungrouped fibers, and results is keyed "all".
+        selected = self._select_traces(trace, "wavecal_master")
 
         for group, (wave, linelist) in results.items():
-            if group in traces_by_group:
-                group_traces = traces_by_group[group]
-            elif group in traces_by_fiber:
-                group_traces = traces_by_fiber[group]
-            elif "all" in traces_by_group:
-                group_traces = traces_by_group["all"]
-            else:
+            # Prefer the same grouping wavecal_master used (handles MOSAIC, where
+            # results is keyed "all" but the trace list mixes bundle reps with
+            # raw fibers). Fall back to matching trace.group for named-group
+            # instruments, then to all selected traces.
+            group_traces = selected.get(group)
+            if not group_traces:
+                group_traces = [
+                    t
+                    for t in trace
+                    if (str(t.group) if t.group is not None else "all") == group
+                ]
+            if not group_traces and group.startswith("fiber_"):
+                try:
+                    fidx = int(group.split("_", 1)[1])
+                    group_traces = [t for t in trace if t.fiber_idx == fidx]
+                except ValueError:
+                    pass
+            if not group_traces:
+                group_traces = selected.get("all")
+            if not group_traces:
                 logger.warning("No traces found for group '%s'", group)
                 continue
 
-            # Update trace.m from obase if not already set
+            # Update trace.m from obase if not already set.
+            # Skip when traces are bundles of a single-order spectrograph --
+            # there t.bundle is the meaningful spatial id and m must stay None.
+            single_order = _is_single_order_multi_bundle(group_traces)
             obase = linelist.obase
-            if obase is not None:
-                already_have_m = any(t.m is not None for _i, t in group_traces)
+            if obase is not None and not single_order:
+                already_have_m = any(t.m is not None for t in group_traces)
                 if already_have_m:
                     logger.debug(
                         "Traces for group '%s' already have m values, skipping obase",
                         group,
                     )
                 else:
-                    for idx_in_group, (_i, t) in enumerate(group_traces):
+                    for idx_in_group, t in enumerate(group_traces):
                         t.m = obase + idx_in_group
                     logger.info(
                         "Updated trace order numbers for group '%s' with obase=%d",
@@ -1770,13 +1942,13 @@ class WavelengthCalibrationFinalize(Step):
 
             # Store wavelength polynomial in each trace.
             if self.dimensionality == "1D":
-                for idx_in_group, (_i, t) in enumerate(group_traces):
+                for idx_in_group, t in enumerate(group_traces):
                     if idx_in_group < len(wave):
                         t.wave = wave[idx_in_group]
             else:
                 # Evaluate 2D poly P(x, order_idx) at each trace's 0-based
                 # index to get a 1D poly in x (np.polyfit convention).
-                for idx_in_group, (_i, t) in enumerate(group_traces):
+                for idx_in_group, t in enumerate(group_traces):
                     poly_1d = np.polynomial.polynomial.polyval(idx_in_group, wave.T)
                     t.wave = poly_1d[::-1]
 
@@ -1991,8 +2163,11 @@ class LaserFrequencyCombFinalize(Step):
         """
         comb, chead = freq_comb_master
 
-        # Get base wavelengths from traces
-        wlen = wavelengths_from_traces(trace)
+        selected = self._select_traces(trace, "wavecal")
+        flat_traces = [t for group in selected.values() for t in group]
+
+        # Get base wavelengths from selected traces
+        wlen = wavelengths_from_traces(flat_traces)
         if wlen is None:
             raise ValueError("No wavelength data in traces - run wavecal first")
 
@@ -2019,7 +2194,7 @@ class LaserFrequencyCombFinalize(Step):
         poly_degree = (
             self.degree[0] if isinstance(self.degree, (list, tuple)) else self.degree
         )
-        for i, t in enumerate(trace):
+        for i, t in enumerate(flat_traces):
             cr = t.column_range
             x_cr = x[cr[0] : cr[1]]
             w_cr = new_wave[i, cr[0] : cr[1]]
@@ -2158,10 +2333,13 @@ class SlitCurvatureDetermination(CalibrationStep, ExtractionStep):
                 trace_objects, header = load_traces(trace_file)
 
                 # Update each trace with slit data from fitted traces
-                for i, t in enumerate(traces):
-                    if i < len(trace_objects):
-                        trace_objects[i].slit = t.slit
-                        trace_objects[i].slitdelta = t.slitdelta
+                # Match by (m, group) since traces may be a filtered subset
+                fitted = {(t.m, t.group): t for t in traces}
+                for t in trace_objects:
+                    match = fitted.get((t.m, t.group))
+                    if match is not None:
+                        t.slit = match.slit
+                        t.slitdelta = match.slitdelta
 
                 # Save updated traces
                 steps = header.get("E_STEPS", "trace").split(",")
@@ -2196,8 +2374,11 @@ class RectifyImage(Step):
         return util.swap_extension(name, ext, path=self.output_dir)
 
     def run(self, files, trace: list[TraceData], mask=None):
+        selected = self._select_traces(trace, "science")
+        flat_traces = [t for group in selected.values() for t in group]
+
         # Get wavelengths from traces (includes freq_comb improvements if run)
-        wave = wavelengths_from_traces(trace)
+        wave = wavelengths_from_traces(flat_traces)
 
         files = files[self.input_files]
 
@@ -2209,7 +2390,7 @@ class RectifyImage(Step):
 
             images, cr, xwd = rectify_image(
                 img,
-                trace,
+                flat_traces,
                 self.extraction_height,
                 self.trace_range,
             )

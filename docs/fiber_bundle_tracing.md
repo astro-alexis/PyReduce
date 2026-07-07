@@ -162,10 +162,34 @@ fibers:
 
 If fiber arrangements differ fundamentally between channels, use separate instrument configs.
 
+### Fiber Numbering Direction
+
+`fiber_idx` is assigned by sorting traces along the cross-dispersion (y) axis
+within each order/group. The `numbering` field controls the direction:
+
+```yaml
+fibers:
+  numbering: top_down   # fiber 1 = highest-y trace
+  # numbering: bottom_up  # (default) fiber 1 = lowest-y trace
+```
+
+- `bottom_up` (default): fiber 1 is the lowest-y trace, counting upward.
+- `top_down`: fiber 1 is the highest-y trace, counting downward.
+
+Set this to match the frame in which your group/bundle `range`s are written.
+The ANDES instruments use `top_down` so that the group ranges line up with the
+ANDES E2E simulator's fiber numbering, where fiber 1 sits at the top of the
+slit (highest y on the detector). If your `range`s appear flipped relative to
+the physical slit, switch this field rather than rewriting every range.
+
 ## Merge Methods
 
 - `average` - Fit polynomial to mean y-positions of all fibers in group
-- `center` - Select the middle fiber's trace
+- `center` - Select the middle fiber's trace (`traces[n//2]`, order-dependent)
+- `center_weight` - Blend all fibers' polynomials with inverse-distance weights
+  to the bundle center. Requires `bundle_centers`. Robust to a missing center
+  fiber (symmetric flanks then average to the center) and order-independent, so
+  it suits bundles where the present-fiber pattern varies between orders.
 - `[i]` or `[i, j, ...]` - Select specific 1-based indices within group
 
 ## Per-Step Trace Selection
@@ -226,13 +250,23 @@ For groups/bundles, heights are derived from fiber spacing within each group (sp
 
 ## Example Instruments
 
-### ANDES_YJH (75 fibers x 18 orders)
+### ANDES_UBV / ANDES_RIZ (66 fibers per order)
 
-Simulated echelle with science fibers A/B and calibration fiber:
-- Fibers 1-35: Science fiber A
-- Fibers 37-39: Calibration fiber
-- Fibers 40-75: Science fiber B
-- Uses `fibers_per_order: 75` with `order_centers_file`
+Simulated echelle spectrographs for visible wavelengths:
+- Fibers 1-31: Slit A
+- Fibers 33-35: Calibration
+- Fibers 36-66: Slit B
+- ANDES_UBV: channels U, B, V (selected by `BAND` header)
+- ANDES_RIZ: channels R, R1, R2, IZ (selected by `HDFMODEL` header, since R variants all have `BAND=R`)
+
+### ANDES_YJH (75 fibers per order)
+
+Simulated NIR echelle with science fibers A/B, calibration, and IFU:
+- Fibers 1-35: Slit A
+- Fibers 37-39: Calibration
+- Fibers 40-75: Slit B
+- Additional groups: ifu, ring0-4 (subsets of the fiber bundle)
+- Channels Y, J, H (selected by `BAND` header)
 
 ### MOSAIC (630 fibers, single order)
 
