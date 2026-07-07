@@ -161,7 +161,8 @@ class HARPSPOL(Instrument):
 
     def get_wavelength_range(self, header, channel, **kwargs):
         wave_range = super().get_wavelength_range(header, channel, **kwargs)
-        # Config lists red→blue (5245→3779 A), matching bottom→top on CCD.
-        # No reversal needed (HARPS single-fiber reverses, but HARPSPOL
-        # dual-beam traces are ordered bottom-to-top = red-to-blue).
+        # Config lists red→blue (5245→3779 A). Since the 0.9 trace rewrite,
+        # traces are numbered bottom-up = blue-first, so the guess must be
+        # reversed to blue→red to line up with spectrum rows.
+        wave_range = wave_range[::-1]
         return wave_range
